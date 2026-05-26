@@ -1,0 +1,121 @@
+name: AI Code Review
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get diff
+        id: diff
+        run: |
+          REPO="${{ github.repository }}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            DIFF=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3.diff" \
+              "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER")
+            echo "event_type=PR #$PR_NUMBER" >> $GITHUB_OUTPUT
+          else
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.event.after }}"
+            # 首个 commit 没有 before，用空树哈希
+            if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BEFORE="4b825dc642cb6eb9a060e54bf899d6e688e7a0b7"
+            fi
+            DIFF=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3.diff" \
+              "https://api.github.com/repos/$REPO/compare/$BEFORE...$AFTER")
+            echo "event_type=push (${{ github.ref_name }})" >> $GITHUB_OUTPUT
+          fi
+
+          # 截断过大的 diff（保留前 8000 字符）
+          DIFF_TRUNCATED=$(echo "$DIFF" | head -c 8000)
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF_TRUNCATED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Call AI review
+        if: steps.diff.outputs.diff != ''
+        id: review
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          API_ENDPOINT: ${{ secrets.API_ENDPOINT }}
+          API_MODEL: ${{ secrets.API_MODEL }}
+        run: |
+          EVENT_TYPE="${{ steps.diff.outputs.event_type }}"
+
+          SYSTEM_PROMPT="你是一个专业的代码审查专家。请审查以下代码变更(diff)，用中文回答。重点关注：
+          1. 代码质量和最佳实践
+          2. 潜在的 bug 和安全问题
+          3. 性能优化建议
+          4. 代码风格和可读性
+
+          请用简洁的 Markdown 格式输出审查结果，末尾添加一个总结评分（1-10分）。"
+
+          USER_PROMPT="请审查以下 $EVENT_TYPE 的代码变更：
+
+          \`\`\`diff
+          ${{ steps.diff.outputs.diff }}
+          \`\`\`"
+
+          # 转义 JSON 字符串
+          ESCAPED_SYSTEM=$(jq -Rs '.' <<< "$SYSTEM_PROMPT")
+          ESCAPED_USER=$(jq -Rs '.' <<< "$USER_PROMPT")
+
+          HTTP_CODE=$(curl -sS -o response.txt -w "%{http_code}" -X POST \
+            "$API_ENDPOINT" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"$API_MODEL\",
+              \"messages\": [
+                {\"role\": \"system\", \"content\": $ESCAPED_SYSTEM},
+                {\"role\": \"user\", \"content\": $ESCAPED_USER}
+              ],
+              \"temperature\": 0.2,
+              \"max_tokens\": 8000
+            }")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "AI API 调用失败，HTTP 状态码: $HTTP_CODE"
+            cat response.txt
+            exit 0
+          fi
+
+          REVIEW=$(jq -r '.choices[0].message.content // empty' response.txt)
+
+          if [ -z "$REVIEW" ] || [ "$REVIEW" = "null" ]; then
+            echo "AI 返回内容为空"
+            exit 0
+          fi
+
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request' && steps.review.outputs.review != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "## 🤖 AI Code Review
+
+          ${{ steps.review.outputs.review }}"
+
+      - name: Write summary
+        if: steps.review.outputs.review != ''
+        run: |
+          echo "## 🤖 AI Code Review — ${{ steps.diff.outputs.event_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.review.outputs.review }}" >> $GITHUB_STEP_SUMMARY

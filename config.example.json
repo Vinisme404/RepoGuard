@@ -1,0 +1,9 @@
+{
+  "api_endpoint": "https://api.openai.com/v1/chat/completions",
+  "model": "gpt-4o-mini",
+  "api_key": "",
+  "api_key_env": "AI_API_KEY",
+  "default_temperature": 0.3,
+  "default_max_tokens": 4096,
+  "language": "zh"
+}
