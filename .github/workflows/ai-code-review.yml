@@ -18,30 +18,43 @@ jobs:
         id: diff
         run: |
           REPO="${{ github.repository }}"
+          GH_API="https://api.github.com/repos/$REPO"
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             PR_NUMBER="${{ github.event.pull_request.number }}"
-            DIFF=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            HTTP_CODE=$(curl -sS -o diff.txt -w "%{http_code}" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3.diff" \
-              "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER")
+              "$GH_API/pulls/$PR_NUMBER")
             echo "event_type=PR #$PR_NUMBER" >> $GITHUB_OUTPUT
           else
             BEFORE="${{ github.event.before }}"
             AFTER="${{ github.event.after }}"
-            # 首个 commit 没有 before，用空树哈希
             if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
               BEFORE="4b825dc642cb6eb9a060e54bf899d6e688e7a0b7"
             fi
-            DIFF=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            HTTP_CODE=$(curl -sS -o diff.txt -w "%{http_code}" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3.diff" \
-              "https://api.github.com/repos/$REPO/compare/$BEFORE...$AFTER")
+              "$GH_API/compare/$BEFORE...$AFTER")
             echo "event_type=push (${{ github.ref_name }})" >> $GITHUB_OUTPUT
           fi
 
-          # 截断过大的 diff（保留前 8000 字符）
-          DIFF_TRUNCATED=$(echo "$DIFF" | head -c 8000)
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "获取 diff 失败，HTTP 状态码: $HTTP_CODE，可能为首个提交或无变更"
+            echo "diff=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          DIFF=$(head -c 8000 diff.txt)
+          if [ -z "$DIFF" ]; then
+            echo "diff 为空，跳过审查"
+            echo "diff=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           echo "diff<<EOF" >> $GITHUB_OUTPUT
-          echo "$DIFF_TRUNCATED" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Call AI review
